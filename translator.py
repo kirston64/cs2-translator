@@ -96,7 +96,7 @@ class KeyBuffer:
     """Записывает нажатия клавиш только когда чат CS2 открыт."""
 
     # Клавиши которые открывают чат в CS2
-    CHAT_OPEN_KEYS = {"enter", "y", "u"}
+    CHAT_OPEN_KEYS = {"y", "u"}
 
     def __init__(self):
         self._buffer = []
