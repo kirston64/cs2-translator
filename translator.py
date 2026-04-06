@@ -1,6 +1,6 @@
 """
 CS2 Auto Translator
-Перехватывает Alt+Enter, переводит текст из чата CS2 и отправляет перевод.
+Перехватывает Ctrl+Shift+T, переводит текст из чата CS2 и отправляет перевод.
 """
 
 import sys
@@ -110,16 +110,21 @@ class TranslatorCore:
                 except Exception:
                     pass
 
-                # Небольшая задержка чтобы Alt отпустился
+                # Задержка чтобы модификаторы отпустились
+                time.sleep(0.15)
+
+                # Отпускаем все клавиши чтобы не мешали
+                keyboard.release("ctrl")
+                keyboard.release("shift")
                 time.sleep(0.05)
 
                 # Выделяем весь текст в поле ввода чата CS2
                 pyautogui.hotkey("ctrl", "a")
-                time.sleep(0.03)
+                time.sleep(0.08)
 
                 # Копируем
                 pyautogui.hotkey("ctrl", "c")
-                time.sleep(0.05)
+                time.sleep(0.1)
 
                 # Читаем скопированный текст
                 text = pyperclip.paste().strip()
@@ -142,11 +147,13 @@ class TranslatorCore:
 
                 self.signals.log_message.emit(f"[{self.target_lang.upper()}] {translated}")
 
-                # Вставляем перевод
+                # Выделяем старый текст и вставляем перевод
+                pyautogui.hotkey("ctrl", "a")
+                time.sleep(0.05)
                 pyperclip.copy(translated)
-                time.sleep(0.02)
+                time.sleep(0.05)
                 pyautogui.hotkey("ctrl", "v")
-                time.sleep(0.02)
+                time.sleep(0.08)
 
                 # Отправляем сообщение
                 pyautogui.press("enter")
@@ -309,7 +316,7 @@ class MainWindow(QMainWindow):
         title = QLabel("CS2 Translator")
         title.setObjectName("title")
         title_col.addWidget(title)
-        subtitle = QLabel("Alt+Enter  -  перевод и отправка")
+        subtitle = QLabel("Ctrl+Shift+T  -  перевод и отправка")
         subtitle.setObjectName("subtitle")
         title_col.addWidget(subtitle)
         header.addLayout(title_col)
@@ -416,9 +423,9 @@ class MainWindow(QMainWindow):
 
     def _register_hotkey(self):
         try:
-            keyboard.add_hotkey("alt+enter", self._on_hotkey, suppress=True)
+            keyboard.add_hotkey("ctrl+shift+t", self._on_hotkey, suppress=True)
             self.hotkey_registered = True
-            self._append_log("[SYS] Хоткей Alt+Enter зарегистрирован")
+            self._append_log("[SYS] Хоткей Ctrl+Shift+T зарегистрирован")
         except Exception as e:
             self._append_log(f"[SYS] Ошибка регистрации хоткея: {e}")
 
@@ -468,7 +475,7 @@ class MainWindow(QMainWindow):
 
     def _to_tray(self):
         self.hide()
-        self.tray.showMessage("CS2 Translator", "Свёрнут в трей. Alt+Enter работает.", QSystemTrayIcon.Information, 2000)
+        self.tray.showMessage("CS2 Translator", "Свёрнут в трей. Ctrl+Shift+T работает.", QSystemTrayIcon.Information, 2000)
 
     def _show_from_tray(self):
         self.show()
