@@ -1,12 +1,11 @@
 """
 CS2 Auto Translator
-Перехватывает Ctrl+Shift+T, переводит текст из чата CS2 и отправляет перевод.
+Записывает нажатия клавиш в буфер, по Ctrl+Shift+T переводит и отправляет.
 """
 
 import sys
 import time
 import threading
-import pyperclip
 import keyboard
 import pyautogui
 from deep_translator import GoogleTranslator
@@ -55,9 +54,24 @@ LANGUAGES = {
 
 SOURCE_LANG = "ru"
 
+# Клавиши-модификаторы которые НЕ записываем в буфер
+MODIFIER_KEYS = {
+    "ctrl", "left ctrl", "right ctrl",
+    "shift", "left shift", "right shift",
+    "alt", "left alt", "right alt",
+    "left windows", "right windows",
+    "caps lock", "tab", "escape",
+    "f1", "f2", "f3", "f4", "f5", "f6",
+    "f7", "f8", "f9", "f10", "f11", "f12",
+    "insert", "delete", "home", "end",
+    "page up", "page down",
+    "up", "down", "left", "right",
+    "print screen", "scroll lock", "pause",
+    "num lock",
+}
+
 
 def create_icon_pixmap(size=64, color="#6C5CE7"):
-    """Создаёт иконку программатически."""
     pixmap = QPixmap(size, size)
     pixmap.fill(Qt.transparent)
     painter = QPainter(pixmap)
@@ -74,16 +88,68 @@ def create_icon_pixmap(size=64, color="#6C5CE7"):
 
 
 class TranslatorSignals(QObject):
-    """Сигналы для потокобезопасного обновления UI."""
     log_message = pyqtSignal(str)
     status_update = pyqtSignal(str)
 
 
-class TranslatorCore:
-    """Ядро переводчика — перевод + ввод в CS2."""
+class KeyBuffer:
+    """Записывает нажатия клавиш в текстовый буфер."""
 
-    def __init__(self, signals):
+    def __init__(self):
+        self._buffer = []
+        self._lock = threading.Lock()
+        self._active = False
+
+    def start(self):
+        """Начать запись."""
+        with self._lock:
+            self._buffer.clear()
+            self._active = True
+
+    def stop(self):
+        """Остановить запись."""
+        with self._lock:
+            self._active = False
+
+    def on_key(self, event):
+        """Обработчик нажатия клавиши."""
+        if not self._active or event.event_type != "down":
+            return
+
+        name = event.name
+
+        # Пропускаем модификаторы
+        if name.lower() in MODIFIER_KEYS:
+            return
+
+        with self._lock:
+            if name == "backspace":
+                if self._buffer:
+                    self._buffer.pop()
+            elif name == "space":
+                self._buffer.append(" ")
+            elif name == "enter":
+                # Enter = отправка сообщения, очищаем буфер
+                self._buffer.clear()
+                self._active = False
+            elif len(name) == 1:
+                self._buffer.append(name)
+
+    def get_text(self):
+        with self._lock:
+            return "".join(self._buffer)
+
+    def clear(self):
+        with self._lock:
+            self._buffer.clear()
+
+
+class TranslatorCore:
+    """Ядро переводчика."""
+
+    def __init__(self, signals, key_buffer):
         self.signals = signals
+        self.key_buffer = key_buffer
         self.target_lang = "en"
         self.enabled = True
         self._translator_cache = {}
@@ -97,40 +163,20 @@ class TranslatorCore:
         return self._translator_cache[target]
 
     def translate_and_send(self):
-        """Основной цикл: копировать текст, перевести, вставить, отправить."""
+        """Берёт текст из буфера, переводит, стирает оригинал и печатает перевод."""
         if not self.enabled:
             return
 
         with self._lock:
             try:
-                # Сохраняем текущий буфер обмена
-                old_clipboard = ""
-                try:
-                    old_clipboard = pyperclip.paste()
-                except Exception:
-                    pass
+                # Останавливаем запись на время работы
+                self.key_buffer.stop()
 
-                # Задержка чтобы модификаторы отпустились
-                time.sleep(0.15)
+                text = self.key_buffer.get_text().strip()
 
-                # Отпускаем все клавиши чтобы не мешали
-                keyboard.release("ctrl")
-                keyboard.release("shift")
-                time.sleep(0.05)
-
-                # Выделяем весь текст в поле ввода чата CS2
-                pyautogui.hotkey("ctrl", "a")
-                time.sleep(0.08)
-
-                # Копируем
-                pyautogui.hotkey("ctrl", "c")
-                time.sleep(0.1)
-
-                # Читаем скопированный текст
-                text = pyperclip.paste().strip()
-
-                if not text or text == old_clipboard.strip():
-                    self.signals.log_message.emit("[!] Пустой текст или не удалось скопировать")
+                if not text:
+                    self.signals.log_message.emit("[!] Буфер пуст — нечего переводить")
+                    self.key_buffer.start()
                     return
 
                 self.signals.log_message.emit(f"[RU] {text}")
@@ -143,34 +189,43 @@ class TranslatorCore:
                 if not translated:
                     self.signals.log_message.emit("[!] Ошибка перевода")
                     self.signals.status_update.emit("Готов")
+                    self.key_buffer.start()
                     return
 
                 self.signals.log_message.emit(f"[{self.target_lang.upper()}] {translated}")
 
-                # Выделяем старый текст и вставляем перевод
-                pyautogui.hotkey("ctrl", "a")
+                # Ждём отпускания модификаторов
+                time.sleep(0.15)
+                keyboard.release("ctrl")
+                keyboard.release("shift")
                 time.sleep(0.05)
-                pyperclip.copy(translated)
-                time.sleep(0.05)
-                pyautogui.hotkey("ctrl", "v")
-                time.sleep(0.08)
 
-                # Отправляем сообщение
+                # Стираем оригинальный текст из чата (backspace по количеству символов)
+                for _ in range(len(text) + 5):  # +5 на всякий случай
+                    pyautogui.press("backspace")
+                    time.sleep(0.005)
+
+                time.sleep(0.05)
+
+                # Печатаем перевод посимвольно через keyboard (поддерживает любую раскладку)
+                keyboard.write(translated, delay=0.01)
+                time.sleep(0.05)
+
+                # Отправляем
                 pyautogui.press("enter")
 
                 self.signals.status_update.emit("Готов")
                 self.signals.log_message.emit("--- Отправлено ---")
 
-                # Восстанавливаем буфер обмена
-                time.sleep(0.1)
-                try:
-                    pyperclip.copy(old_clipboard)
-                except Exception:
-                    pass
+                # Очищаем буфер и снова начинаем запись
+                self.key_buffer.clear()
+                self.key_buffer.start()
 
             except Exception as e:
                 self.signals.log_message.emit(f"[ERROR] {e}")
                 self.signals.status_update.emit("Ошибка")
+                self.key_buffer.clear()
+                self.key_buffer.start()
 
 
 STYLESHEET = """
@@ -201,10 +256,6 @@ QLabel#status {
     padding: 4px 12px;
     background-color: rgba(0, 184, 148, 30);
     border-radius: 8px;
-}
-QLabel#status[error="true"] {
-    color: #ff7675;
-    background-color: rgba(255, 118, 117, 30);
 }
 QComboBox {
     background-color: #16213e;
@@ -286,7 +337,8 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.signals = TranslatorSignals()
-        self.core = TranslatorCore(self.signals)
+        self.key_buffer = KeyBuffer()
+        self.core = TranslatorCore(self.signals, self.key_buffer)
         self.hotkey_registered = False
 
         self.setWindowTitle("CS2 Translator")
@@ -297,9 +349,8 @@ class MainWindow(QMainWindow):
         self._init_ui()
         self._connect_signals()
         self._setup_tray()
-        self._register_hotkey()
+        self._register_hooks()
 
-        # Для перетаскивания окна
         self._drag_pos = None
 
     def _init_ui(self):
@@ -310,7 +361,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(20, 16, 20, 16)
         layout.setSpacing(12)
 
-        # Заголовок + кнопка закрытия
+        # Заголовок
         header = QHBoxLayout()
         title_col = QVBoxLayout()
         title = QLabel("CS2 Translator")
@@ -322,7 +373,6 @@ class MainWindow(QMainWindow):
         header.addLayout(title_col)
         header.addStretch()
 
-        # Кнопка свернуть в трей
         minimize_btn = QPushButton("_")
         minimize_btn.setFixedSize(30, 30)
         minimize_btn.setStyleSheet("""
@@ -342,7 +392,6 @@ class MainWindow(QMainWindow):
         header.addWidget(close_btn)
         layout.addLayout(header)
 
-        # Разделитель
         sep = QFrame()
         sep.setObjectName("separator")
         sep.setFrameShape(QFrame.HLine)
@@ -357,7 +406,7 @@ class MainWindow(QMainWindow):
         self.lang_combo = QComboBox()
         for name in LANGUAGES:
             self.lang_combo.addItem(name, LANGUAGES[name])
-        self.lang_combo.setCurrentIndex(0)  # English по умолчанию
+        self.lang_combo.setCurrentIndex(0)
         self.lang_combo.currentIndexChanged.connect(self._on_lang_change)
         lang_row.addWidget(self.lang_combo)
         lang_row.addStretch()
@@ -373,7 +422,6 @@ class MainWindow(QMainWindow):
         status_row.addWidget(self.status)
         status_row.addStretch()
 
-        # Кнопка вкл/выкл
         self.toggle_btn = QPushButton("ВКЛ")
         self.toggle_btn.setObjectName("toggle")
         self.toggle_btn.setProperty("active", True)
@@ -382,7 +430,22 @@ class MainWindow(QMainWindow):
         status_row.addWidget(self.toggle_btn)
         layout.addLayout(status_row)
 
-        # Опция: оставлять окно поверх
+        # Буфер (показываем что записано)
+        buf_row = QHBoxLayout()
+        buf_label = QLabel("Буфер:")
+        buf_label.setStyleSheet("font-size: 12px; color: #888;")
+        buf_row.addWidget(buf_label)
+        self.buf_display = QLabel("")
+        self.buf_display.setStyleSheet("font-size: 12px; color: #6C5CE7;")
+        buf_row.addWidget(self.buf_display)
+        buf_row.addStretch()
+        layout.addLayout(buf_row)
+
+        # Таймер обновления буфера
+        self.buf_timer = QTimer()
+        self.buf_timer.timeout.connect(self._update_buf_display)
+        self.buf_timer.start(200)
+
         self.topmost_cb = QCheckBox("Поверх всех окон")
         self.topmost_cb.setChecked(True)
         self.topmost_cb.stateChanged.connect(self._toggle_topmost)
@@ -396,7 +459,7 @@ class MainWindow(QMainWindow):
         self.log = QTextEdit()
         self.log.setObjectName("log")
         self.log.setReadOnly(True)
-        self.log.setMaximumHeight(200)
+        self.log.setMaximumHeight(180)
         layout.addWidget(self.log)
 
         layout.addStretch()
@@ -421,16 +484,22 @@ class MainWindow(QMainWindow):
         self.tray.activated.connect(self._on_tray_activated)
         self.tray.show()
 
-    def _register_hotkey(self):
+    def _register_hooks(self):
         try:
+            # Хук на все клавиши для записи в буфер
+            keyboard.hook(self.key_buffer.on_key)
+            # Хоткей для перевода
             keyboard.add_hotkey("ctrl+shift+t", self._on_hotkey, suppress=True)
             self.hotkey_registered = True
+            # Начинаем запись
+            self.key_buffer.start()
+            self._append_log("[SYS] Запись клавиш активна")
             self._append_log("[SYS] Хоткей Ctrl+Shift+T зарегистрирован")
+            self._append_log("[SYS] Открой чат в CS2, напиши на русском, жми Ctrl+Shift+T")
         except Exception as e:
-            self._append_log(f"[SYS] Ошибка регистрации хоткея: {e}")
+            self._append_log(f"[SYS] Ошибка: {e}")
 
     def _on_hotkey(self):
-        """Вызывается при нажатии Alt+Enter — запускаем перевод в отдельном потоке."""
         thread = threading.Thread(target=self.core.translate_and_send, daemon=True)
         thread.start()
 
@@ -446,10 +515,12 @@ class MainWindow(QMainWindow):
             self.toggle_btn.setText("ВКЛ")
             self.toggle_btn.setProperty("active", True)
             self._update_status("Готов")
+            self.key_buffer.start()
         else:
             self.toggle_btn.setText("ВЫКЛ")
             self.toggle_btn.setProperty("active", False)
             self._update_status("Отключён")
+            self.key_buffer.stop()
         self.toggle_btn.style().unpolish(self.toggle_btn)
         self.toggle_btn.style().polish(self.toggle_btn)
 
@@ -461,9 +532,13 @@ class MainWindow(QMainWindow):
             self.setWindowFlags(flags & ~Qt.WindowStaysOnTopHint)
         self.show()
 
+    def _update_buf_display(self):
+        text = self.key_buffer.get_text()
+        display = text[-40:] if len(text) > 40 else text
+        self.buf_display.setText(display if display else "(пусто)")
+
     def _append_log(self, msg):
         self.log.append(msg)
-        # Ограничиваем лог
         if self.log.document().blockCount() > 200:
             cursor = self.log.textCursor()
             cursor.movePosition(cursor.Start)
@@ -495,7 +570,6 @@ class MainWindow(QMainWindow):
         self._quit()
         event.accept()
 
-    # Перетаскивание безрамочного окна
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
             self._drag_pos = event.globalPos() - self.frameGeometry().topLeft()
@@ -509,7 +583,6 @@ class MainWindow(QMainWindow):
 
 
 def main():
-    # Отключаем паузу pyautogui для скорости
     pyautogui.PAUSE = 0.01
     pyautogui.FAILSAFE = False
 
