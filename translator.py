@@ -93,55 +93,80 @@ class TranslatorSignals(QObject):
 
 
 class KeyBuffer:
-    """Записывает нажатия клавиш в текстовый буфер."""
+    """Записывает нажатия клавиш только когда чат CS2 открыт."""
+
+    # Клавиши которые открывают чат в CS2
+    CHAT_OPEN_KEYS = {"enter", "y", "u"}
 
     def __init__(self):
         self._buffer = []
         self._lock = threading.Lock()
-        self._active = False
+        self._enabled = True       # общий вкл/выкл
+        self._chat_open = False     # чат CS2 открыт?
 
-    def start(self):
-        """Начать запись."""
+    def set_enabled(self, val):
         with self._lock:
-            self._buffer.clear()
-            self._active = True
-
-    def stop(self):
-        """Остановить запись."""
-        with self._lock:
-            self._active = False
+            self._enabled = val
+            if not val:
+                self._chat_open = False
+                self._buffer.clear()
 
     def on_key(self, event):
         """Обработчик нажатия клавиши."""
-        if not self._active or event.event_type != "down":
+        if not self._enabled or event.event_type != "down":
             return
 
         name = event.name
+        lower = name.lower()
 
         # Пропускаем модификаторы
-        if name.lower() in MODIFIER_KEYS:
+        if lower in MODIFIER_KEYS:
             return
 
         with self._lock:
-            if name == "backspace":
+            if not self._chat_open:
+                # Чат закрыт — ждём клавишу открытия чата
+                if lower in self.CHAT_OPEN_KEYS:
+                    self._chat_open = True
+                    self._buffer.clear()
+                return
+
+            # Чат открыт — записываем
+            if lower == "escape":
+                # Закрыл чат без отправки
+                self._chat_open = False
+                self._buffer.clear()
+            elif lower == "backspace":
                 if self._buffer:
                     self._buffer.pop()
-            elif name == "space":
+            elif lower == "space":
                 self._buffer.append(" ")
-            elif name == "enter":
-                # Enter = отправка сообщения, очищаем буфер
+            elif lower == "enter":
+                # Отправил сообщение (без перевода)
+                self._chat_open = False
                 self._buffer.clear()
-                self._active = False
             elif len(name) == 1:
                 self._buffer.append(name)
+
+    @property
+    def chat_open(self):
+        with self._lock:
+            return self._chat_open
 
     def get_text(self):
         with self._lock:
             return "".join(self._buffer)
 
-    def clear(self):
+    def clear_and_close(self):
         with self._lock:
             self._buffer.clear()
+            self._chat_open = False
+
+    def reopen(self):
+        """Снова начать запись (после перевода)."""
+        with self._lock:
+            self._buffer.clear()
+            self._chat_open = False
 
 
 class TranslatorCore:
@@ -169,14 +194,10 @@ class TranslatorCore:
 
         with self._lock:
             try:
-                # Останавливаем запись на время работы
-                self.key_buffer.stop()
-
                 text = self.key_buffer.get_text().strip()
 
                 if not text:
                     self.signals.log_message.emit("[!] Буфер пуст — нечего переводить")
-                    self.key_buffer.start()
                     return
 
                 self.signals.log_message.emit(f"[RU] {text}")
@@ -189,7 +210,6 @@ class TranslatorCore:
                 if not translated:
                     self.signals.log_message.emit("[!] Ошибка перевода")
                     self.signals.status_update.emit("Готов")
-                    self.key_buffer.start()
                     return
 
                 self.signals.log_message.emit(f"[{self.target_lang.upper()}] {translated}")
@@ -217,15 +237,12 @@ class TranslatorCore:
                 self.signals.status_update.emit("Готов")
                 self.signals.log_message.emit("--- Отправлено ---")
 
-                # Очищаем буфер и снова начинаем запись
-                self.key_buffer.clear()
-                self.key_buffer.start()
+                self.key_buffer.reopen()
 
             except Exception as e:
                 self.signals.log_message.emit(f"[ERROR] {e}")
                 self.signals.status_update.emit("Ошибка")
-                self.key_buffer.clear()
-                self.key_buffer.start()
+                self.key_buffer.reopen()
 
 
 STYLESHEET = """
@@ -491,11 +508,9 @@ class MainWindow(QMainWindow):
             # Хоткей для перевода
             keyboard.add_hotkey("ctrl+shift+t", self._on_hotkey, suppress=True)
             self.hotkey_registered = True
-            # Начинаем запись
-            self.key_buffer.start()
-            self._append_log("[SYS] Запись клавиш активна")
             self._append_log("[SYS] Хоткей Ctrl+Shift+T зарегистрирован")
-            self._append_log("[SYS] Открой чат в CS2, напиши на русском, жми Ctrl+Shift+T")
+            self._append_log("[SYS] Запись включается только когда чат открыт (Enter/Y/U)")
+            self._append_log("[SYS] Напиши в чате на русском, жми Ctrl+Shift+T")
         except Exception as e:
             self._append_log(f"[SYS] Ошибка: {e}")
 
@@ -515,12 +530,12 @@ class MainWindow(QMainWindow):
             self.toggle_btn.setText("ВКЛ")
             self.toggle_btn.setProperty("active", True)
             self._update_status("Готов")
-            self.key_buffer.start()
+            self.key_buffer.set_enabled(True)
         else:
             self.toggle_btn.setText("ВЫКЛ")
             self.toggle_btn.setProperty("active", False)
             self._update_status("Отключён")
-            self.key_buffer.stop()
+            self.key_buffer.set_enabled(False)
         self.toggle_btn.style().unpolish(self.toggle_btn)
         self.toggle_btn.style().polish(self.toggle_btn)
 
@@ -533,9 +548,12 @@ class MainWindow(QMainWindow):
         self.show()
 
     def _update_buf_display(self):
+        if not self.key_buffer.chat_open:
+            self.buf_display.setText("(чат закрыт)")
+            return
         text = self.key_buffer.get_text()
         display = text[-40:] if len(text) > 40 else text
-        self.buf_display.setText(display if display else "(пусто)")
+        self.buf_display.setText(display if display else "(печатай...)")
 
     def _append_log(self, msg):
         self.log.append(msg)
